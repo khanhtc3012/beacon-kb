@@ -1,4 +1,5 @@
 requests==2.34.2
+beautifulsoup4==4.15.0
 markdownify==1.2.3
 openai==3.16.0
 python-dotenv==1.2.3
