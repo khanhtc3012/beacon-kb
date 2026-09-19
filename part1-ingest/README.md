@@ -47,3 +47,11 @@ Each file is uploaded with its `article_id` and a hash of its text and chunk set
 [sync] added=30 updated=0 skipped=0 removed=0 failed=0 duration=25s
 [embedded] files=30 est_chunks=~114 (max=800 overlap=200)
 ```
+
+## Sample answer
+
+The assistant in the OpenAI Playground (model `gpt-5.6-luna`, File search on a small test vector store):
+
+![Playground answer to "How do I add a YouTube video?"](docs/screenshot.jpg)
+
+The answer has five steps and one `Article URL:` line that points to the source article.
