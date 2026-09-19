@@ -18,7 +18,7 @@ SYSTEM_PROMPT = (
     "• Max 5 bullet points; else link to the doc.\n"
     '• Cite up to 3 "Article URL:" lines per reply.'
 )
-DEFAULT_MODEL = "gpt-4.1-mini"
+DEFAULT_MODEL = "gpt-5.4-mini"
 
 
 def ask(client, store_id: str, question: str, model: str = DEFAULT_MODEL):
