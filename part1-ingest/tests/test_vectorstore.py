@@ -225,3 +225,18 @@ def test_delete_store_removes_store_and_its_files():
     assert vs.delete_store(client, "vs_1") == 2
     assert client.deleted_stores == ["vs_1"]
     assert client.deleted_files == ["f1", "f2"]
+
+
+def test_token_estimate_falls_back_to_characters_when_tiktoken_is_unavailable(monkeypatch):
+    class Broken:
+        @staticmethod
+        def get_encoding(name):
+            raise ConnectionError("cannot download the vocabulary")
+
+    monkeypatch.setitem(__import__("sys").modules, "tiktoken", Broken)
+    vs._encoding.cache_clear()
+    try:
+        assert vs.count_tokens("x" * 400) == 100
+        assert vs.count_tokens("") == 0
+    finally:
+        vs._encoding.cache_clear()

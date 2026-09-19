@@ -68,13 +68,20 @@ def file_attributes(doc, chunking: Chunking) -> Dict[str, str]:
 
 @lru_cache(maxsize=1)
 def _encoding():
-    import tiktoken
+    try:
+        import tiktoken
 
-    return tiktoken.get_encoding(TOKEN_ENCODING)
+        return tiktoken.get_encoding(TOKEN_ENCODING)
+    except Exception as exc:  # tiktoken downloads its vocabulary on first use; an estimate must not fail the job
+        log.warning("tiktoken unavailable (%s: %s), estimating tokens as characters / 4", type(exc).__name__, exc)
+        return None
 
 
 def count_tokens(text: str) -> int:
-    return len(_encoding().encode(text, disallowed_special=()))
+    encoding = _encoding()
+    if encoding is None:
+        return math.ceil(len(text) / 4)
+    return len(encoding.encode(text, disallowed_special=()))
 
 
 def estimate_chunks(tokens: int, chunking: Chunking) -> int:

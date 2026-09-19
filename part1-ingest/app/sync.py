@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from app.delta import Delta, classify
+from app.logs import configure_logging
 from app.scrape import scrape
 from app.vectorstore import (
     CHUNK_OVERLAP_TOKENS,
@@ -97,9 +98,18 @@ def sync(client, store_id: str, docs: Sequence, chunking: Chunking, remove_missi
     return result
 
 
+def log_result(result: SyncResult, seconds: float) -> None:
+    """The run summary: counts first, then each failure and problem."""
+    log.info("[sync] added=%d updated=%d skipped=%d removed=%d failed=%d duration=%ds",
+             result.added, result.updated, result.skipped, result.removed, result.failed, seconds)
+    for article_id, reason in result.failures:
+        log.warning("failed: %s: %s", article_id, reason)
+    for problem in result.problems:
+        log.error("%s", problem)
+
+
 def main(argv=None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # one INFO line per HTTP call, with ids in the URL
+    configure_logging()
     load_dotenv()
     parser = argparse.ArgumentParser(description="Sync help-center articles into an OpenAI vector store.")
     parser.add_argument("--limit", type=int, default=None, help="only the first N articles (never removes)")
@@ -150,13 +160,7 @@ def main(argv=None) -> int:
         return 0 if not problems else 1
 
     result = sync(client, get_or_create_store(client, args.store_name), docs, chunking, remove_missing)
-    log.info("[sync] added=%d updated=%d skipped=%d removed=%d failed=%d duration=%ds",
-             result.added, result.updated, result.skipped, result.removed, result.failed,
-             time.monotonic() - started)
-    for article_id, reason in result.failures:
-        log.warning("failed: %s: %s", article_id, reason)
-    for problem in result.problems:
-        log.error("%s", problem)
+    log_result(result, time.monotonic() - started)
     return 0 if result.ok else 1
 
 

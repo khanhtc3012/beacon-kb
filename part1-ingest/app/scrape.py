@@ -10,6 +10,7 @@ from typing import Iterable, Iterator, Optional
 from dotenv import load_dotenv
 
 from app.convert import filename, to_markdown
+from app.logs import configure_logging
 from app.zendesk import fetch_articles
 
 log = logging.getLogger("beacon-kb")
@@ -51,7 +52,7 @@ def write_docs(docs: Iterable[Doc], out_dir: Path) -> int:
 
 
 def main(argv=None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+    configure_logging()
     load_dotenv()
     parser = argparse.ArgumentParser(description="Scrape help-center articles to Markdown files.")
     parser.add_argument("--out", default="out", help="output directory (default: out)")
