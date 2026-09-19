@@ -1,0 +1,11 @@
+2026-09-19T08:33:27 2026-09-19 08:33:27,018 INFO [job] start store=support-kb locale=en-us limit=30 chunking=800/200
+2026-09-19T08:33:31 2026-09-19 08:33:31,797 INFO [scrape] fetched=30 skipped_draft=0 skipped_empty=0
+2026-09-19T08:33:35 2026-09-19 08:33:35,590 INFO created vector store 'support-kb'
+2026-09-19T08:33:52 2026-09-19 08:33:52,535 INFO [sync] added=30 updated=0 skipped=0 removed=0 failed=0 duration=25s
+2026-09-19T08:33:52 2026-09-19 08:33:52,535 INFO [embedded] files=30 est_chunks=~114 (max=800 overlap=200)
+2026-09-19T08:33:52 2026-09-19 08:33:52,535 INFO [store] name=support-kb total_files=30 completed=30 failed=0 in_progress=0
+2026-09-19T08:40:24 2026-09-19 08:40:24,975 INFO [job] start store=support-kb locale=en-us limit=30 chunking=800/200
+2026-09-19T08:40:29 2026-09-19 08:40:29,666 INFO [scrape] fetched=30 skipped_draft=0 skipped_empty=0
+2026-09-19T08:40:33 2026-09-19 08:40:33,781 INFO [sync] added=0 updated=0 skipped=30 removed=0 failed=0 duration=8s
+2026-09-19T08:40:33 2026-09-19 08:40:33,781 INFO [embedded] files=0 est_chunks=~0 (max=800 overlap=200)
+2026-09-19T08:40:33 2026-09-19 08:40:33,782 INFO [store] name=support-kb total_files=30 completed=30 failed=0 in_progress=0
