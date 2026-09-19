@@ -50,15 +50,16 @@ class UploadResult:
     failures: List[Tuple[str, str]] = field(default_factory=list)  # (article id or filename, reason)
 
 
-def content_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def fingerprint(markdown: str, chunking: Chunking) -> str:
+    """Hash of what ends up in the store: the text and how it was chunked, so changing either re-uploads."""
+    return hashlib.sha256(f"{chunking.max_tokens}/{chunking.overlap_tokens}\n{markdown}".encode("utf-8")).hexdigest()
 
 
-def file_attributes(doc) -> Dict[str, str]:
-    """Per-file metadata stored in the vector store; the delta step reads it back."""
+def file_attributes(doc, chunking: Chunking) -> Dict[str, str]:
+    """Per-file metadata stored in the vector store; `list_remote` reads it back."""
     attrs = {
         "article_id": doc.article_id,
-        "content_hash": content_hash(doc.markdown),
+        "content_hash": fingerprint(doc.markdown, chunking),
         "url": doc.url,
         "updated_at": doc.updated_at,
     }
@@ -86,15 +87,20 @@ def estimate_chunks(tokens: int, chunking: Chunking) -> int:
     return 1 + math.ceil((tokens - chunking.max_tokens) / stride)
 
 
+def find_store(client, name: str):
+    """The vector store called `name` (the most recent one if several), or None."""
+    matches = [store for store in client.vector_stores.list(limit=100) if store.name == name]
+    if len(matches) > 1:
+        log.warning("%d vector stores are named %r, using the most recent", len(matches), name)
+    return matches[0] if matches else None
+
+
 def get_or_create_store(client, name: str) -> str:
     """Return the id of the vector store called `name`, creating it if missing."""
-    matches = [store for store in client.vector_stores.list(limit=100) if store.name == name]
-    if matches:
-        if len(matches) > 1:
-            log.warning("%d vector stores are named %r, using the most recent", len(matches), name)
-        return matches[0].id
-    store = client.vector_stores.create(name=name)
-    log.info("created vector store %r", name)
+    store = find_store(client, name)
+    if store is None:
+        store = client.vector_stores.create(name=name)
+        log.info("created vector store %r", name)
     return store.id
 
 
@@ -148,7 +154,7 @@ def upload_docs(
         batch = client.vector_stores.file_batches.create_and_poll(
             store_id,
             files=[
-                {"file_id": file_id, "attributes": file_attributes(doc), "chunking_strategy": chunking.param()}
+                {"file_id": file_id, "attributes": file_attributes(doc, chunking), "chunking_strategy": chunking.param()}
                 for doc, file_id in part
             ],
         )
@@ -164,14 +170,54 @@ def upload_docs(
     return result
 
 
-def list_remote(client, store_id: str) -> Dict[str, str]:
-    """Map article id -> content hash for files already in the store."""
-    raise NotImplementedError("step 6")
+@dataclass
+class RemoteFile:
+    file_id: str
+    content_hash: str
+    created_at: int = 0
+
+
+@dataclass
+class Remote:
+    files: Dict[str, RemoteFile] = field(default_factory=dict)  # article id -> its newest completed file
+    junk: List[str] = field(default_factory=list)  # file ids to delete: failed, cancelled, older duplicates
+
+
+def list_remote(client, store_id: str) -> Remote:
+    """What the store holds now, read from the attributes `upload_docs` attached."""
+    remote = Remote()
+    for item in client.vector_stores.files.list(store_id, limit=100):
+        attrs = item.attributes or {}
+        article_id = attrs.get("article_id")
+        if item.status in ("failed", "cancelled"):
+            remote.junk.append(item.id)
+            continue
+        if item.status != "completed":
+            log.warning("file %s is still %s, leaving it alone", item.id, item.status)
+            continue
+        if not article_id:
+            log.warning("file %s has no article_id, leaving it alone", item.id)
+            continue
+        found = RemoteFile(item.id, attrs.get("content_hash", ""), item.created_at)
+        current = remote.files.get(article_id)
+        if current is not None:
+            log.warning("article %s is in the store twice, keeping the newer file", article_id)
+            current, found = sorted((current, found), key=lambda f: f.created_at)
+            remote.junk.append(current.file_id)
+        remote.files[article_id] = found
+    return remote
 
 
 def delete_file(client, store_id: str, file_id: str) -> None:
-    """Remove a file from the store and delete the underlying file."""
-    raise NotImplementedError("step 6")
+    """Remove a file from the store and delete the underlying file (removing it from the store leaves it behind)."""
+    for delete in (
+        lambda: client.vector_stores.files.delete(file_id, vector_store_id=store_id),
+        lambda: client.files.delete(file_id),
+    ):
+        try:
+            delete()
+        except openai.NotFoundError:
+            pass
 
 
 def delete_store(client, store_id: str) -> int:

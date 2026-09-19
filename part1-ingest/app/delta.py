@@ -8,11 +8,23 @@ class Delta:
     added: List[str] = field(default_factory=list)
     updated: List[str] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
+    removed: List[str] = field(default_factory=list)
 
 
-def classify(scraped: Dict[str, str], remote: Dict[str, str]) -> Delta:
-    """Both arguments map article id -> content hash.
+def classify(scraped: Dict[str, str], remote: Dict[str, str], remove_missing: bool = False) -> Delta:
+    """Both mappings are article id -> fingerprint.
 
-    Not in `remote` -> added; hash differs -> updated; otherwise skipped.
+    Not in `remote` -> added; fingerprint differs -> updated; otherwise skipped.
+    With `remove_missing`, ids in `remote` but no longer scraped are removed.
     """
-    raise NotImplementedError("step 6")
+    delta = Delta()
+    for article_id, fingerprint in scraped.items():
+        if article_id not in remote:
+            delta.added.append(article_id)
+        elif remote[article_id] != fingerprint:
+            delta.updated.append(article_id)
+        else:
+            delta.skipped.append(article_id)
+    if remove_missing:
+        delta.removed = sorted(set(remote) - set(scraped))
+    return delta
