@@ -48,6 +48,37 @@ Each file is uploaded with its `article_id` and a hash of its text and chunk set
 [embedded] files=30 est_chunks=~114 (max=800 overlap=200)
 ```
 
+## Daily job on AWS
+
+`deploy/aws.sh` deploys the job to AWS: an EventBridge schedule starts an ECS Fargate task every day at 02:00 (Asia/Ho_Chi_Minh), the image is kept in ECR, the OpenAI key in SSM Parameter Store, and the logs go to CloudWatch. It is written for AWS CloudShell, from the repository root:
+
+```bash
+bash part1-ingest/deploy/aws.sh up        # build and push the image, create the job and the schedule
+bash part1-ingest/deploy/aws.sh run       # run it once and print the log
+bash part1-ingest/deploy/aws.sh publish   # optional: publish the CloudShell view of the log by hand
+bash part1-ingest/deploy/aws.sh down      # delete everything
+```
+
+By default the job syncs the first 30 articles (`ARTICLE_LIMIT`; set it to an empty value for all of them).
+
+### Status page
+
+At the end of every run the job itself overwrites three files in a public S3 bucket (`beacon-kb-logs-<8 characters>`, created by `up`, only `public/` is readable):
+
+| File | Content |
+|---|---|
+| `public/index.html` | the latest result, a table of the last 30 runs, and the log of the latest run |
+| `public/last_run.log` | the log of the latest run as plain text |
+| `public/runs.json` | the history the table is built from |
+
+The addresses never change, because the job always writes the same keys. `up` prints the page address: `https://beacon-kb-logs-<8 characters>.s3.ap-southeast-1.amazonaws.com/public/index.html`. It shows up after the first run.
+
+The job needs `LOG_BUCKET` for this (`up` sets it; without it nothing is published). `LOG_PREFIX` (default `public`) and `REPO_URL` are optional. A problem while publishing is logged and never changes the exit code of the sync. The job refuses to publish a log that looks like it holds an API key, an ARN or an OpenAI id.
+
+If the account has Block Public Access turned on for all buckets, `up` stops and says so: the page cannot be public until the bucket-policy settings are allowed.
+
+`publish` is only for a manual snapshot: it copies the CloudShell view of the log (last 72 hours) to the same addresses. The logs of two runs on AWS are in [`docs/last_run.log`](docs/last_run.log).
+
 ## Sample answer
 
 The assistant in the OpenAI Playground (model `gpt-5.6-luna`, File search on a small test vector store):

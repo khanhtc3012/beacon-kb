@@ -5,3 +5,4 @@ openai==3.16.0
 python-dotenv==1.2.3
 tiktoken==0.14.0
 pytest==9.1.1
+boto3==1.43.98

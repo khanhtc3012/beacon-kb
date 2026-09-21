@@ -6,10 +6,10 @@
 #
 #     bash part1-ingest/deploy/aws.sh <command>
 #
-#   up             build and push the image, create everything, register the daily schedule
-#   run            run the job once, wait for it, print the exit code and the log
+#   up             create the status page bucket, build and push the image, create the job and the daily schedule
+#   run            run the job once, wait for it, print the exit code and the log (the job rewrites the status page)
 #   test-schedule  start a one-time schedule 3 minutes from now (proves EventBridge starts the task)
-#   publish        copy the recent job logs to a public S3 page and print the link
+#   publish        write a snapshot of the CloudWatch logs to the status page (the job rewrites it after every run)
 #   status         show what exists now
 #   down           delete everything, including the bucket
 #
@@ -19,6 +19,7 @@
 #   SCHEDULE_CRON, SCHEDULE_TZ   when the job runs (default 02:00 Asia/Ho_Chi_Minh)
 #   LOG_WINDOW         how far back `publish` reads the logs (default 72h)
 #   DEPLOY_REGION      AWS region (default ap-southeast-1)
+#   LOG_EXPIRE_DAYS    delete the published files after this many days (default: keep them)
 set -euo pipefail
 
 # Fixed names and region on purpose: generic variables such as NAME or AWS_REGION are often already set
@@ -31,11 +32,13 @@ VECTOR_STORE_NAME=${VECTOR_STORE_NAME:-support-kb}
 SCHEDULE_CRON=${SCHEDULE_CRON:-cron(0 2 * * ? *)}
 SCHEDULE_TZ=${SCHEDULE_TZ:-Asia/Ho_Chi_Minh}
 LOG_WINDOW=${LOG_WINDOW:-72h}
+LOG_EXPIRE_DAYS=${LOG_EXPIRE_DAYS:-}
 REPO_URL=${REPO_URL:-https://github.com/khanhtc3012/beacon-kb}
 
 APP_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 EXEC_ROLE=$NAME-task-exec
 SCHED_ROLE=$NAME-scheduler
+TASK_ROLE=$NAME-task  # the role the running job uses to write its status page
 PARAM=/$NAME/openai-api-key
 LOG_GROUP=/ecs/$NAME
 WORK=$(mktemp -d)
@@ -82,24 +85,50 @@ EOF
   NEW_ROLE=1
 }
 
+# The bucket for the status page. Only the public/ prefix can be read, and the bucket cannot be listed.
+ensure_bucket() {
+  local blocked
+  blocked=$(aws s3control get-public-access-block --account-id "$ACCOUNT_ID" \
+    --query 'PublicAccessBlockConfiguration.[BlockPublicPolicy,RestrictPublicBuckets]' --output text 2>/dev/null || true)
+  case "$blocked" in *True*|*true*) die "S3 Block Public Access is on for this whole account. Turn off 'Block public bucket policies' in S3 > Block Public Access settings for this account, then run this again." ;; esac
+  if ! have aws s3api head-bucket --bucket "$BUCKET"; then
+    if [ "$REGION" = us-east-1 ]; then aws s3api create-bucket --bucket "$BUCKET" >/dev/null
+    else aws s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null; fi
+  fi
+  # ACLs stay blocked; only a bucket policy for the public/ prefix can open it
+  aws s3api put-public-access-block --bucket "$BUCKET" \
+    --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false
+  if [ -n "$LOG_EXPIRE_DAYS" ]; then
+    aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --lifecycle-configuration \
+      "{\"Rules\":[{\"ID\":\"expire-public-logs\",\"Status\":\"Enabled\",\"Filter\":{\"Prefix\":\"public/\"},\"Expiration\":{\"Days\":$LOG_EXPIRE_DAYS}}]}"
+  else
+    aws s3api delete-bucket-lifecycle --bucket "$BUCKET" 2>/dev/null || true
+  fi
+  aws s3api put-bucket-policy --bucket "$BUCKET" --policy \
+    "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PublicReadStatusPage\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$BUCKET/public/*\"}]}"
+}
+
 cmd_up() {
   init
   command -v docker >/dev/null || die "docker is not available in this shell"
   [ "$(uname -m)" = x86_64 ] || die "this shell is $(uname -m); the task is defined as X86_64, so the image must be built on x86_64"
   [ -f "$APP_DIR/Dockerfile" ] || die "run this from a clone of the repository (no Dockerfile in $APP_DIR)"
 
-  say "1/8 image repository (keeps the last 2 images)"
+  say "1/9 status page bucket (only public/ is readable)"
+  ensure_bucket
+
+  say "2/9 image repository (keeps the last 2 images)"
   have aws ecr describe-repositories --repository-names "$NAME" || aws ecr create-repository --repository-name "$NAME" >/dev/null
   aws ecr put-lifecycle-policy --repository-name "$NAME" --lifecycle-policy-text \
     '{"rules":[{"rulePriority":1,"description":"keep the last 2 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":2},"action":{"type":"expire"}}]}' >/dev/null
 
-  say "2/8 build and push the image"
+  say "3/9 build and push the image"
   docker build -t "$NAME" "$APP_DIR"
   aws ecr get-login-password | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
   docker tag "$NAME:latest" "$IMAGE"
   docker push "$IMAGE"
 
-  say "3/8 OpenAI key in SSM Parameter Store (encrypted)"
+  say "4/9 OpenAI key in SSM Parameter Store (encrypted)"
   if [ -z "${RESET_KEY:-}" ] && have aws ssm get-parameter --name "$PARAM"; then
     echo "already stored in $REGION (set RESET_KEY=1 to replace it)"
   else
@@ -112,11 +141,11 @@ cmd_up() {
   fi
   aws ssm get-parameter --name "$PARAM" --query 'Parameter.[Name,Type]' --output text || die "the parameter is not in $REGION"
 
-  say "4/8 log group (7 days)"
+  say "5/9 log group (7 days)"
   aws logs create-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
   aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 7
 
-  say "5/8 IAM roles"
+  say "6/9 IAM roles"
   NEW_ROLE=""
   ensure_role "$EXEC_ROLE" ecs-tasks.amazonaws.com
   aws iam attach-role-policy --role-name "$EXEC_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
@@ -124,19 +153,27 @@ cmd_up() {
 {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ssm:GetParameters","Resource":"arn:aws:ssm:$REGION:$ACCOUNT_ID:parameter$PARAM"}]}
 EOF
   aws iam put-role-policy --role-name "$EXEC_ROLE" --policy-name read-openai-key --policy-document "file://$WORK/ssm-read.json"
+  ensure_role "$TASK_ROLE" ecs-tasks.amazonaws.com
+  cat > "$WORK/task-s3.json" <<EOF
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::$BUCKET/public/*"},
+ {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::$BUCKET"}
+]}
+EOF
+  aws iam put-role-policy --role-name "$TASK_ROLE" --policy-name write-status-page --policy-document "file://$WORK/task-s3.json"
   ensure_role "$SCHED_ROLE" scheduler.amazonaws.com
   cat > "$WORK/scheduler-perm.json" <<EOF
 {"Version":"2012-10-17","Statement":[
  {"Effect":"Allow","Action":"ecs:RunTask","Resource":"arn:aws:ecs:$REGION:$ACCOUNT_ID:task-definition/$NAME:*","Condition":{"ArnLike":{"ecs:cluster":"arn:aws:ecs:$REGION:$ACCOUNT_ID:cluster/$NAME"}}},
- {"Effect":"Allow","Action":"iam:PassRole","Resource":"arn:aws:iam::$ACCOUNT_ID:role/$EXEC_ROLE","Condition":{"StringLike":{"iam:PassedToService":"ecs-tasks.amazonaws.com"}}}
+ {"Effect":"Allow","Action":"iam:PassRole","Resource":["arn:aws:iam::$ACCOUNT_ID:role/$EXEC_ROLE","arn:aws:iam::$ACCOUNT_ID:role/$TASK_ROLE"],"Condition":{"StringLike":{"iam:PassedToService":"ecs-tasks.amazonaws.com"}}}
 ]}
 EOF
   aws iam put-role-policy --role-name "$SCHED_ROLE" --policy-name run-task --policy-document "file://$WORK/scheduler-perm.json"
   [ -z "$NEW_ROLE" ] || { echo "waiting for IAM to settle"; sleep 12; }
 
-  say "6/8 ECS cluster and task definition"
+  say "7/9 ECS cluster and task definition"
   aws ecs create-cluster --cluster-name "$NAME" >/dev/null
-  ENV_JSON="{\"name\":\"VECTOR_STORE_NAME\",\"value\":\"$VECTOR_STORE_NAME\"}"
+  ENV_JSON="{\"name\":\"VECTOR_STORE_NAME\",\"value\":\"$VECTOR_STORE_NAME\"},{\"name\":\"LOG_BUCKET\",\"value\":\"$BUCKET\"},{\"name\":\"LOG_PREFIX\",\"value\":\"public\"},{\"name\":\"REPO_URL\",\"value\":\"$REPO_URL\"}"
   [ -z "$ARTICLE_LIMIT" ] || ENV_JSON="$ENV_JSON,{\"name\":\"ARTICLE_LIMIT\",\"value\":\"$ARTICLE_LIMIT\"}"
   cat > "$WORK/taskdef.json" <<EOF
 {
@@ -144,6 +181,7 @@ EOF
   "requiresCompatibilities": ["FARGATE"],
   "runtimePlatform": {"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},
   "executionRoleArn": "arn:aws:iam::$ACCOUNT_ID:role/$EXEC_ROLE",
+  "taskRoleArn": "arn:aws:iam::$ACCOUNT_ID:role/$TASK_ROLE",
   "containerDefinitions": [{
     "name": "$NAME", "image": "$IMAGE", "essential": true,
     "secrets": [{"name": "OPENAI_API_KEY", "valueFrom": "arn:aws:ssm:$REGION:$ACCOUNT_ID:parameter$PARAM"}],
@@ -154,11 +192,11 @@ EOF
 EOF
   aws ecs register-task-definition --cli-input-json "file://$WORK/taskdef.json" --query 'taskDefinition.[family,revision,status]' --output text
 
-  say "7/8 network (default VPC, public subnet, no NAT gateway)"
+  say "8/9 network (default VPC, public subnet, no NAT gateway)"
   network
   echo "subnet=$SUBNET sg=$SG"
 
-  say "8/8 daily schedule: $SCHEDULE_CRON ($SCHEDULE_TZ)"
+  say "9/9 daily schedule: $SCHEDULE_CRON ($SCHEDULE_TZ)"
   write_target
   if have aws scheduler get-schedule --name "$NAME-daily"; then verb=update-schedule; else verb=create-schedule; fi
   aws scheduler "$verb" --name "$NAME-daily" --state ENABLED \
@@ -168,9 +206,10 @@ EOF
   cat <<EOF
 
 Done. Next:
-  bash $0 run            # run the job once and see the result
+  bash $0 run            # run the job once; it also writes the status page
   bash $0 test-schedule  # prove the schedule starts the task (about 3 minutes)
-  bash $0 publish        # public S3 link with the logs
+The status page: https://$BUCKET.s3.$REGION.amazonaws.com/public/index.html
+(it appears after the first run and is rewritten by the job after every run)
 EOF
 }
 
@@ -204,7 +243,7 @@ cmd_test_schedule() {
   aws scheduler create-schedule --name "$NAME-once" --state ENABLED --action-after-completion DELETE \
     --schedule-expression "at($when)" --schedule-expression-timezone UTC \
     --flexible-time-window Mode=OFF --target "file://$WORK/target.json" --query ScheduleArn --output text
-  echo "Wait about 5 minutes, then:  bash $0 publish"
+  echo "Wait about 5 minutes: the job rewrites the status page when it finishes."
 }
 
 # Refuse to publish anything that looks like a secret or an id of this account.
@@ -255,20 +294,7 @@ cmd_publish() {
   scan_log "$WORK/last_run.log"
 
   say "bucket $BUCKET"
-  blocked=$(aws s3control get-public-access-block --account-id "$ACCOUNT_ID" \
-    --query 'PublicAccessBlockConfiguration.[BlockPublicPolicy,RestrictPublicBuckets]' --output text 2>/dev/null || true)
-  case "$blocked" in *True*|*true*) die "S3 Block Public Access is on for this whole account. Turn off 'Block public bucket policies' in S3 > Block Public Access settings for this account, then run publish again." ;; esac
-  if ! have aws s3api head-bucket --bucket "$BUCKET"; then
-    if [ "$REGION" = us-east-1 ]; then aws s3api create-bucket --bucket "$BUCKET" >/dev/null
-    else aws s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null; fi
-  fi
-  # ACLs stay blocked; only a bucket policy for the public/ prefix can open it
-  aws s3api put-public-access-block --bucket "$BUCKET" \
-    --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false
-  aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --lifecycle-configuration \
-    '{"Rules":[{"ID":"expire-public-logs","Status":"Enabled","Filter":{"Prefix":"public/"},"Expiration":{"Days":30}}]}'
-  aws s3api put-bucket-policy --bucket "$BUCKET" --policy \
-    "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PublicReadRunLogs\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$BUCKET/public/*\"}]}"
+  ensure_bucket
 
   build_index "$WORK/last_run.log" "$WORK/index.html"
   aws s3 cp "$WORK/last_run.log" "s3://$BUCKET/public/last_run.log" --content-type "text/plain; charset=utf-8" --cache-control no-cache >/dev/null
@@ -277,13 +303,14 @@ cmd_publish() {
   base=https://$BUCKET.s3.$REGION.amazonaws.com/public
   cat <<EOF
 
-Published. Give the interviewers this link:
-  $base/index.html
-Plain log:
-  $base/last_run.log
+Published:
+  $base/index.html    (the runs and the full log)
+  $base/last_run.log  (plain text)
 
-Only these two files are public (the bucket cannot be listed) and they expire after 30 days.
-Open the link in a private window to check it. Remove everything with:  bash $0 down
+The address does not change. This is a snapshot of the CloudWatch logs of the last $LOG_WINDOW;
+the job itself rewrites the same files at the end of every run.
+Only these two files are public (the bucket cannot be listed).${LOG_EXPIRE_DAYS:+ They are deleted after $LOG_EXPIRE_DAYS days.}
+Remove everything with:  bash $0 down
 EOF
 }
 
@@ -294,7 +321,7 @@ cmd_status() {
   have aws ssm get-parameter --name "$PARAM" && echo "ssm parameter:   yes" || echo "ssm parameter:   no"
   echo "ecs cluster:     $(aws ecs describe-clusters --clusters "$NAME" --query 'clusters[0].status' --output text 2>/dev/null || echo no)"
   echo "schedule:        $(aws scheduler get-schedule --name "$NAME-daily" --query '[State,ScheduleExpression]' --output text 2>/dev/null || echo no)"
-  echo "roles:           $(have aws iam get-role --role-name "$EXEC_ROLE" && echo exec-yes || echo exec-no) $(have aws iam get-role --role-name "$SCHED_ROLE" && echo scheduler-yes || echo scheduler-no)"
+  echo "roles:           $(have aws iam get-role --role-name "$EXEC_ROLE" && echo exec-yes || echo exec-no) $(have aws iam get-role --role-name "$TASK_ROLE" && echo task-yes || echo task-no) $(have aws iam get-role --role-name "$SCHED_ROLE" && echo scheduler-yes || echo scheduler-no)"
   echo "bucket:          $(have aws s3api head-bucket --bucket "$BUCKET" && echo "yes ($BUCKET)" || echo no)"
 }
 
@@ -310,7 +337,7 @@ cmd_down() {
   step "image repository" aws ecr delete-repository --repository-name "$NAME" --force
   step "log group" aws logs delete-log-group --log-group-name "$LOG_GROUP"
   step "stored key" aws ssm delete-parameter --name "$PARAM"
-  for role in "$EXEC_ROLE" "$SCHED_ROLE"; do
+  for role in "$EXEC_ROLE" "$TASK_ROLE" "$SCHED_ROLE"; do
     step "role $role" bash -c "for p in \$(aws iam list-attached-role-policies --role-name $role --query 'AttachedPolicies[].PolicyArn' --output text); do aws iam detach-role-policy --role-name $role --policy-arn \$p; done; for p in \$(aws iam list-role-policies --role-name $role --query 'PolicyNames[]' --output text); do aws iam delete-role-policy --role-name $role --policy-name \$p; done; aws iam delete-role --role-name $role"
   done
   step "bucket $BUCKET" bash -c "aws s3 rm s3://$BUCKET --recursive; aws s3api delete-bucket --bucket $BUCKET"
